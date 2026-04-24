@@ -1,0 +1,27 @@
+# Lightweight Dockerfile for LightRAG API-only deployment (no WebUI)
+# Build: docker build -f Dockerfile.api -t lightrag-api .
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project files
+COPY pyproject.toml setup.py ./
+COPY lightrag/ ./lightrag/
+
+# Install API dependencies + neo4j driver
+RUN pip install --no-cache-dir ".[api]" neo4j \
+    && rm -rf /root/.cache/pip
+
+# Create data directories
+RUN mkdir -p /app/data/rag_storage /app/data/inputs
+
+ENV WORKING_DIR=/app/data/rag_storage
+ENV INPUT_DIR=/app/data/inputs
+
+EXPOSE 9621
+
+CMD ["lightrag-server"]

@@ -14,6 +14,9 @@ import re
 import logging
 import logging.config
 import sys
+import asyncio
+import contextvars
+from collections import OrderedDict
 import uvicorn
 import pipmaster as pm
 from fastapi.staticfiles import StaticFiles
@@ -75,6 +78,121 @@ webui_description = os.getenv("WEBUI_DESCRIPTION")
 
 # Global authentication configuration
 auth_configured = bool(auth_handler.accounts)
+
+# ─── Multi-tenant workspace support ───────────────────────────────────
+_current_rag: contextvars.ContextVar["LightRAG"] = contextvars.ContextVar(
+    "_current_rag"
+)
+
+
+class RagPool:
+    """LRU pool of LightRAG instances keyed by workspace.
+
+    Each workspace gets its own LightRAG instance with isolated storage
+    (Neo4J labels, vector collections, KV files, etc.).
+    When the pool is full, the least-recently-used instance is evicted
+    and its storages are finalized.
+    """
+
+    def __init__(self, default_rag: "LightRAG", create_kwargs: dict, max_size: int = 50):
+        self.default_rag = default_rag
+        self.default_workspace: str = getattr(default_rag, "workspace", "") or ""
+        self._create_kwargs = create_kwargs
+        self._instances: OrderedDict[str, "LightRAG"] = OrderedDict()
+        self._instances[self.default_workspace] = default_rag
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._max_size = max_size
+
+    async def get(self, workspace: str | None = None) -> "LightRAG":
+        """Return the RAG instance for *workspace*, creating it if needed."""
+        if not workspace or workspace == self.default_workspace:
+            return self.default_rag
+
+        # Fast path – already cached
+        if workspace in self._instances:
+            self._instances.move_to_end(workspace)
+            return self._instances[workspace]
+
+        # Slow path – need to create; serialize per-workspace
+        if workspace not in self._locks:
+            self._locks[workspace] = asyncio.Lock()
+
+        async with self._locks[workspace]:
+            # Double-check after acquiring lock
+            if workspace in self._instances:
+                self._instances.move_to_end(workspace)
+                return self._instances[workspace]
+
+            # Evict LRU if the pool is full (never evict the default)
+            while len(self._instances) >= self._max_size:
+                key, old = self._instances.popitem(last=False)
+                if old is self.default_rag:
+                    # Put default back and try next
+                    self._instances[key] = old
+                    self._instances.move_to_end(key)
+                    # Pop the *next* oldest instead
+                    if len(self._instances) >= self._max_size:
+                        _, old2 = self._instances.popitem(last=False)
+                        try:
+                            await old2.finalize_storages()
+                        except Exception:
+                            pass
+                    break
+                try:
+                    await old.finalize_storages()
+                except Exception:
+                    pass
+
+            # Create a new instance for this workspace
+            rag = LightRAG(**{**self._create_kwargs, "workspace": workspace})
+            await rag.initialize_storages()
+            self._instances[workspace] = rag
+            logger.info(f"RagPool: created workspace '{workspace}' ({len(self._instances)}/{self._max_size})")
+            return rag
+
+    async def finalize_all(self):
+        """Finalize all cached instances (called on shutdown)."""
+        for ws, rag in list(self._instances.items()):
+            try:
+                await rag.finalize_storages()
+            except Exception:
+                logger.warning(f"RagPool: error finalizing workspace '{ws}'")
+        self._instances.clear()
+
+
+class RagProxy:
+    """Transparent proxy that delegates attribute access to the LightRAG
+    instance for the *current* workspace (set by the HTTP middleware via
+    the ``_current_rag`` context-var).
+
+    Because the route factory functions (``create_query_routes(rag, ...)``)
+    capture ``rag`` by closure, replacing the concrete instance with this
+    proxy makes every ``rag.aquery(...)`` call transparently hit the right
+    workspace – **zero changes required in the router files**.
+    """
+
+    def __init__(self, pool: RagPool):
+        object.__setattr__(self, "_pool", pool)
+
+    def __getattr__(self, name: str):
+        try:
+            rag = _current_rag.get()
+        except LookupError:
+            rag = object.__getattribute__(self, "_pool").default_rag
+        return getattr(rag, name)
+
+    def __repr__(self):
+        try:
+            rag = _current_rag.get()
+            return f"<RagProxy -> {rag.workspace!r}>"
+        except LookupError:
+            pool = object.__getattribute__(self, "_pool")
+            return f"<RagProxy -> default:{pool.default_workspace!r}>"
+
+
+# Global reference – set inside create_app(), used by middleware
+_rag_pool: RagPool | None = None
+# ─────────────────────────────────────────────────────────────────────
 
 
 class LLMConfigCache:
@@ -361,8 +479,11 @@ def create_app(args):
             yield
 
         finally:
-            # Clean up database connections
-            await rag.finalize_storages()
+            # Clean up database connections (all workspace instances)
+            if _rag_pool is not None:
+                await _rag_pool.finalize_all()
+            else:
+                await rag.finalize_storages()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1095,19 +1216,78 @@ def create_app(args):
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
 
-    # Add routes
+    # ─── Activate multi-workspace support ───────────────────────────────
+    # Build the kwargs dict that RagPool needs to create new workspace instances
+    global _rag_pool
+    _create_kwargs = dict(
+        working_dir=args.working_dir,
+        llm_model_func=create_llm_model_func(args.llm_binding),
+        llm_model_name=args.llm_model,
+        llm_model_max_async=args.max_async,
+        summary_max_tokens=args.summary_max_tokens,
+        summary_context_size=args.summary_context_size,
+        chunk_token_size=int(args.chunk_size),
+        chunk_overlap_token_size=int(args.chunk_overlap_size),
+        llm_model_kwargs=create_llm_model_kwargs(
+            args.llm_binding, args, llm_timeout
+        ),
+        embedding_func=embedding_func,
+        default_llm_timeout=llm_timeout,
+        default_embedding_timeout=embedding_timeout,
+        kv_storage=args.kv_storage,
+        graph_storage=args.graph_storage,
+        vector_storage=args.vector_storage,
+        doc_status_storage=args.doc_status_storage,
+        vector_db_storage_cls_kwargs={
+            "cosine_better_than_threshold": args.cosine_threshold
+        },
+        enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+        enable_llm_cache=args.enable_llm_cache,
+        rerank_model_func=rerank_model_func,
+        max_parallel_insert=args.max_parallel_insert,
+        max_graph_nodes=args.max_graph_nodes,
+        addon_params={
+            "language": args.summary_language,
+            "entity_types": args.entity_types,
+        },
+        ollama_server_infos=ollama_server_infos,
+    )
+
+    max_workspaces = int(os.getenv("MAX_WORKSPACES", "100"))
+    _rag_pool = RagPool(rag, _create_kwargs, max_size=max_workspaces)
+    rag_proxy = RagProxy(_rag_pool)
+    logger.info(
+        f"RagPool activated: default workspace='{_rag_pool.default_workspace}', "
+        f"max_size={max_workspaces}"
+    )
+
+    # Middleware: resolve workspace from request header and set context var
+    @app.middleware("http")
+    async def workspace_middleware(request: Request, call_next):
+        workspace = get_workspace_from_request(request)
+        resolved_rag = await _rag_pool.get(workspace)
+        token = _current_rag.set(resolved_rag)
+        try:
+            response = await call_next(request)
+        finally:
+            _current_rag.reset(token)
+        return response
+
+    # ─────────────────────────────────────────────────────────────────────
+
+    # Add routes (use rag_proxy so each request hits the right workspace)
     app.include_router(
         create_document_routes(
-            rag,
+            rag_proxy,
             doc_manager,
             api_key,
         )
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
+    app.include_router(create_query_routes(rag_proxy, api_key, args.top_k))
+    app.include_router(create_graph_routes(rag_proxy, api_key))
 
     # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    ollama_api = OllamaAPI(rag_proxy, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
 
     # Custom Swagger UI endpoint for offline support
